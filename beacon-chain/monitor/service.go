@@ -10,6 +10,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/blockchain"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/feed"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/feed/operation"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/cache"
 	statefeed "github.com/OffchainLabs/prysm/v7/beacon-chain/core/feed/state"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/helpers"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
@@ -17,6 +18,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/sirupsen/logrus"
+	"time"
 )
 
 // Error when the context is closed while waiting for sync.
@@ -54,11 +56,12 @@ type ValidatorAggregatedPerformance struct {
 // monitor service tracks, and the event feed notifier that the
 // monitor needs to subscribe.
 type ValidatorMonitorConfig struct {
-	StateNotifier       statefeed.Notifier
-	AttestationNotifier operation.Notifier
-	HeadFetcher         blockchain.HeadFetcher
-	StateGen            stategen.StateManager
-	InitialSyncComplete chan struct{}
+	StateNotifier          statefeed.Notifier
+	AttestationNotifier    operation.Notifier
+	HeadFetcher            blockchain.HeadFetcher
+	StateGen               stategen.StateManager
+	InitialSyncComplete    chan struct{}
+	TrackedValidatorsCache *cache.TrackedValidatorsCache
 }
 
 // Service is the main structure that tracks validators and reports logs and
@@ -68,6 +71,7 @@ type Service struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	isLogging bool
+	autoTrack bool
 
 	// Locks access to TrackedValidators, latestPerformance, aggregatedPerformance,
 	// trackedSyncedCommitteeIndices and lastSyncedEpoch
@@ -81,7 +85,7 @@ type Service struct {
 }
 
 // NewService sets up a new validator monitor service instance when given a list of validator indices to track.
-func NewService(ctx context.Context, config *ValidatorMonitorConfig, tracked []primitives.ValidatorIndex) (*Service, error) {
+func NewService(ctx context.Context, config *ValidatorMonitorConfig, tracked []primitives.ValidatorIndex, autoTrack bool) (*Service, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	r := &Service{
 		config:                      config,
@@ -92,6 +96,7 @@ func NewService(ctx context.Context, config *ValidatorMonitorConfig, tracked []p
 		aggregatedPerformance:       make(map[primitives.ValidatorIndex]ValidatorAggregatedPerformance),
 		trackedSyncCommitteeIndices: make(map[primitives.ValidatorIndex][]primitives.CommitteeIndex),
 		isLogging:                   false,
+		autoTrack:                   autoTrack,
 	}
 	for _, idx := range tracked {
 		r.TrackedValidators[idx] = true
@@ -137,10 +142,18 @@ func (s *Service) run() {
 	log.WithField("epoch", epoch).Info("Synced to head epoch, starting reporting performance")
 
 	s.Lock()
-	s.initializePerformanceStructures(st, epoch)
+	indices := make([]primitives.ValidatorIndex, 0, len(s.TrackedValidators))
+	for idx := range s.TrackedValidators {
+		indices = append(indices, idx)
+	}
+	s.initializePerformanceStructures(st, epoch, indices)
 	s.Unlock()
 
 	s.updateSyncCommitteeTrackedVals(st)
+
+	if s.autoTrack {
+		go s.trackNewValidators(s.ctx)
+	}
 
 	s.Lock()
 	s.isLogging = true
@@ -152,9 +165,10 @@ func (s *Service) run() {
 }
 
 // initializePerformanceStructures initializes the validatorLatestPerformance
-// and validatorAggregatedPerformance for each tracked validator.
-func (s *Service) initializePerformanceStructures(state state.BeaconState, epoch primitives.Epoch) {
-	for idx := range s.TrackedValidators {
+// and validatorAggregatedPerformance for each tracked validator in the given list.
+// Caller should hold the service Lock.
+func (s *Service) initializePerformanceStructures(state state.BeaconState, epoch primitives.Epoch, indices []primitives.ValidatorIndex) {
+	for _, idx := range indices {
 		balance, err := state.BalanceAtIndex(idx)
 		if err != nil {
 			log.WithError(err).WithField("validatorIndex", idx).Error(
@@ -280,6 +294,13 @@ func (s *Service) trackedIndex(idx primitives.ValidatorIndex) bool {
 func (s *Service) updateSyncCommitteeTrackedVals(state state.BeaconState) {
 	s.Lock()
 	defer s.Unlock()
+	s.doUpdateSyncCommitteeTrackedVals(state)
+	s.lastSyncedEpoch = slots.ToEpoch(state.Slot())
+}
+
+// doUpdateSyncCommitteeTrackedVals updates the sync committee assignments of our
+// tracked validators. Caller should hold the service Lock.
+func (s *Service) doUpdateSyncCommitteeTrackedVals(state state.BeaconState) {
 	for idx := range s.TrackedValidators {
 		syncIdx, err := helpers.CurrentPeriodSyncSubcommitteeIndices(state, idx)
 		if err != nil {
@@ -292,5 +313,63 @@ func (s *Service) updateSyncCommitteeTrackedVals(state state.BeaconState) {
 			s.trackedSyncCommitteeIndices[idx] = syncIdx
 		}
 	}
-	s.lastSyncedEpoch = slots.ToEpoch(state.Slot())
+}
+
+// trackNewValidators periodically checks for new local validators in the cache and adds them to the tracked list.
+func (s *Service) trackNewValidators(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.doTrackNewValidators(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *Service) doTrackNewValidators(ctx context.Context) {
+	if s.config.TrackedValidatorsCache == nil {
+		return
+	}
+	indicesMap := s.config.TrackedValidatorsCache.Indices()
+	var newIndices []primitives.ValidatorIndex
+	s.RLock()
+	for idx := range indicesMap {
+		if !s.TrackedValidators[idx] {
+			newIndices = append(newIndices, idx)
+		}
+	}
+	s.RUnlock()
+
+	if len(newIndices) == 0 {
+		return
+	}
+
+	st, err := s.config.HeadFetcher.HeadState(ctx)
+	if err != nil {
+		log.WithError(err).Error("Could not get head state for auto-tracking")
+		return
+	}
+	epoch := slots.ToEpoch(st.Slot())
+
+	s.Lock()
+	defer s.Unlock()
+	added := make([]primitives.ValidatorIndex, 0, len(newIndices))
+	for _, idx := range newIndices {
+		if s.TrackedValidators[idx] {
+			continue
+		}
+		s.TrackedValidators[idx] = true
+		added = append(added, idx)
+	}
+
+	if len(added) > 0 {
+		log.WithFields(logrus.Fields{
+			"validatorIndices": added,
+		}).Info("Auto-tracking new validators")
+		s.initializePerformanceStructures(st, epoch, added)
+		s.doUpdateSyncCommitteeTrackedVals(st)
+	}
 }

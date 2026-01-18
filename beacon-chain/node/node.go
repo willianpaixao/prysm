@@ -1054,13 +1054,32 @@ func (b *BeaconNode) registerHTTPService(router *http.ServeMux) error {
 }
 
 func (b *BeaconNode) registerValidatorMonitorService(initialSyncComplete chan struct{}) error {
-	cliSlice := b.cliCtx.IntSlice(cmd.ValidatorMonitorIndicesFlag.Name)
-	if cliSlice == nil {
+	cliSlice := b.cliCtx.StringSlice(cmd.ValidatorMonitorIndicesFlag.Name)
+	if len(cliSlice) == 0 {
 		return nil
 	}
-	tracked := make([]primitives.ValidatorIndex, len(cliSlice))
-	for i := range tracked {
-		tracked[i] = primitives.ValidatorIndex(cliSlice[i])
+	autoTrack := false
+	var tracked []primitives.ValidatorIndex
+	for _, s := range cliSlice {
+		if s == "auto" {
+			autoTrack = true
+			break
+		}
+	}
+
+	if autoTrack {
+		if len(cliSlice) > 1 {
+			log.Warn("Validator monitor indices 'auto' option provided, ignoring other indices")
+		}
+	} else {
+		tracked = make([]primitives.ValidatorIndex, 0, len(cliSlice))
+		for _, s := range cliSlice {
+			idx, err := strconv.ParseUint(s, 10, 64)
+			if err != nil {
+				return errors.Wrapf(err, "could not parse validator index %s", s)
+			}
+			tracked = append(tracked, primitives.ValidatorIndex(idx))
+		}
 	}
 
 	var chainService *blockchain.Service
@@ -1068,13 +1087,14 @@ func (b *BeaconNode) registerValidatorMonitorService(initialSyncComplete chan st
 		return err
 	}
 	monitorConfig := &monitor.ValidatorMonitorConfig{
-		StateNotifier:       b,
-		AttestationNotifier: b,
-		StateGen:            b.stateGen,
-		HeadFetcher:         chainService,
-		InitialSyncComplete: initialSyncComplete,
+		StateNotifier:          b,
+		AttestationNotifier:    b,
+		StateGen:               b.stateGen,
+		HeadFetcher:            chainService,
+		InitialSyncComplete:    initialSyncComplete,
+		TrackedValidatorsCache: b.trackedValidatorsCache,
 	}
-	svc, err := monitor.NewService(b.ctx, monitorConfig, tracked)
+	svc, err := monitor.NewService(b.ctx, monitorConfig, tracked, autoTrack)
 	if err != nil {
 		return err
 	}
