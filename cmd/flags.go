@@ -256,10 +256,11 @@ var (
 		Usage: "Accepts Terms and Conditions (for non-interactive environments).",
 	}
 	// ValidatorMonitorIndicesFlag specifies a list of validator indices to
-	// track for performance updates
-	ValidatorMonitorIndicesFlag = &cli.IntSliceFlag{
+	// track for performance updates. It also accepts "auto" to automatically
+	// track local validators.
+	ValidatorMonitorIndicesFlag = &cli.StringSliceFlag{
 		Name:  "monitor-indices",
-		Usage: "List of validator indices to track performance",
+		Usage: "List of validator indices to track performance. It also accepts 'auto' to automatically track local validators.",
 	}
 
 	// RestoreSourceFileFlag specifies the filepath to the backed-up database file

@@ -50,8 +50,8 @@ func TestNodeClose_OK(t *testing.T) {
 	set.String("deposit-contract", "0x0000000000000000000000000000000000000000", "deposit contract address")
 	set.String("suggested-fee-recipient", "0x6e35733c5af9B61374A128e6F85f553aF09ff89A", "fee recipient")
 	require.NoError(t, set.Set("suggested-fee-recipient", "0x6e35733c5af9B61374A128e6F85f553aF09ff89A"))
-	cmd.ValidatorMonitorIndicesFlag.Value = &cli.IntSlice{}
-	cmd.ValidatorMonitorIndicesFlag.Value.SetInt(1)
+	cmd.ValidatorMonitorIndicesFlag.Value = &cli.StringSlice{}
+	require.NoError(t, cmd.ValidatorMonitorIndicesFlag.Value.Set("1"))
 	ctx, cancel := newCliContextWithCancel(&app, set)
 
 	options := []Option{
@@ -171,6 +171,22 @@ func TestMonitor_RegisteredCorrectly(t *testing.T) {
 	require.Equal(t, true, mService.TrackedValidators[1])
 	require.Equal(t, true, mService.TrackedValidators[2])
 	require.Equal(t, false, mService.TrackedValidators[100])
+}
+
+func TestMonitor_RegisteredCorrectlyAuto(t *testing.T) {
+	app := cli.App{}
+	set := flag.NewFlagSet("test", 0)
+	require.NoError(t, cmd.ValidatorMonitorIndicesFlag.Apply(set))
+	cliCtx := cli.NewContext(&app, set, nil)
+	require.NoError(t, cliCtx.Set(cmd.ValidatorMonitorIndicesFlag.Name, "auto"))
+	n := &BeaconNode{ctx: context.Background(), cliCtx: cliCtx, services: runtime.NewServiceRegistry()}
+	require.NoError(t, n.services.RegisterService(&blockchain.Service{}))
+	require.NoError(t, n.registerValidatorMonitorService(make(chan struct{})))
+
+	var mService *monitor.Service
+	require.NoError(t, n.services.FetchService(&mService))
+	// TrackedValidators should be empty initially in auto mode
+	require.Equal(t, 0, len(mService.TrackedValidators))
 }
 
 func Test_hasNetworkFlag(t *testing.T) {

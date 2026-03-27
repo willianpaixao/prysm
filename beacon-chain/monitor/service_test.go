@@ -8,6 +8,7 @@ import (
 	"time"
 
 	mock "github.com/OffchainLabs/prysm/v7/beacon-chain/blockchain/testing"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/cache"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/altair"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/feed"
 	statefeed "github.com/OffchainLabs/prysm/v7/beacon-chain/core/feed/state"
@@ -134,7 +135,7 @@ func TestNewService(t *testing.T) {
 	config := &ValidatorMonitorConfig{}
 	var tracked []primitives.ValidatorIndex
 	ctx := t.Context()
-	_, err := NewService(ctx, config, tracked)
+	_, err := NewService(ctx, config, tracked, false /* autoTrack */)
 	require.NoError(t, err)
 }
 
@@ -161,7 +162,11 @@ func TestInitializePerformanceStructures(t *testing.T) {
 	state, err := s.config.HeadFetcher.HeadState(ctx)
 	require.NoError(t, err)
 	epoch := slots.ToEpoch(state.Slot())
-	s.initializePerformanceStructures(state, epoch)
+	indices := make([]primitives.ValidatorIndex, 0, len(s.TrackedValidators))
+	for idx := range s.TrackedValidators {
+		indices = append(indices, idx)
+	}
+	s.initializePerformanceStructures(state, epoch, indices)
 	require.LogsDoNotContain(t, hook, "Could not fetch starting balance")
 	latestPerformance := map[primitives.ValidatorIndex]ValidatorLatestPerformance{
 		1: {
@@ -277,4 +282,23 @@ func TestRun(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	require.LogsContain(t, hook, "Synced to head epoch, starting reporting performance")
+}
+
+func TestAutoTrackValidators(t *testing.T) {
+	ctx := t.Context()
+	s := setupService(t)
+	s.autoTrack = true
+	s.TrackedValidators = make(map[primitives.ValidatorIndex]bool)
+	tvCache := cache.NewTrackedValidatorsCache()
+	s.config.TrackedValidatorsCache = tvCache
+
+	// Add a validator to cache
+	tvCache.Set(cache.TrackedValidator{Index: 100, Active: true})
+
+	s.doTrackNewValidators(ctx)
+
+	s.RLock()
+	defer s.RUnlock()
+	require.Equal(t, true, s.TrackedValidators[100])
+	require.Equal(t, uint64(32000000000), s.aggregatedPerformance[100].startBalance)
 }
